@@ -16,6 +16,11 @@ const char* WIFI_SSID = "YOUR_2_4_GHZ_WIFI";
 const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 // Use the Windows PC's LAN IPv4 address, never localhost here.
 const char* SERVER_URL = "http://192.168.1.100:8000/api/readings";
+// Generate on PC: py -3 server.py --create-device-token
+const char* DEVICE_TOKEN = "YOUR_DEVICE_TOKEN";
+// Leave -1 until calibrated against your station and no-carrier receiver noise.
+// Raw RSSI is 0..127, not dBm. Thresholding is a receiver-side estimate only.
+const int CARRIER_RSSI_MIN = -1;
 const uint16_t FM_FREQUENCY = 10000; // 100.00 MHz; PU2CLR uses 10 kHz units
 unsigned long lastWifiAttempt = 0;
 void setup() {
@@ -32,6 +37,21 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
 }
+// RDA5807 sequential read address 0x10 starts with status registers 0x0A/0x0B.
+// Register 0x0B bits 15:9 hold the raw 7-bit RSSI. Check actual module datasheet.
+int readReceiverRssi() {
+#if USE_RADIO
+  if (Wire.requestFrom((uint8_t)0x10, (uint8_t)4) != 4) {
+    while (Wire.available()) Wire.read();
+    return -1;
+  }
+  Wire.read(); Wire.read();
+  uint8_t high = Wire.read(); Wire.read();
+  return high >> 1;
+#else
+  return -1;
+#endif
+}
 void loop() {
   // Average envelope, not raw audio. Eight conversions take about 64 ms.
   float sum=0;
@@ -42,7 +62,15 @@ void loop() {
     HTTPClient http;
     http.setConnectTimeout(1500); http.setTimeout(1500);
     http.begin(SERVER_URL); http.addHeader("Content-Type","application/json");
-    String payload="{\"envelope_mv\":"+String(mv,1)+",\"source\":\"ESP32\"}";
+    http.addHeader("Authorization", String("Bearer ") + DEVICE_TOKEN);
+    int rssi = readReceiverRssi();
+    String carrier = "null";
+    if (rssi >= 0 && CARRIER_RSSI_MIN >= 0) carrier = rssi >= CARRIER_RSSI_MIN ? "true" : "false";
+    String payload = "{\"envelope_mv\":" + String(mv,1)
+      + ",\"carrier_present\":" + carrier
+      + ",\"transmitter_on\":null,\"rssi\":" + (rssi < 0 ? String("null") : String(rssi)) + "}";
+    // transmitter_on must come from a validated, independent transmitter status sensor.
+    // A remote FM receiver cannot prove transmitter power status; never infer it from audio.
     int code=http.POST(payload);
     Serial.printf("HTTP result %d\n",code); http.end();
   } else if (millis()-lastWifiAttempt>10000) {
